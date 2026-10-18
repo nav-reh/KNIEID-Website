@@ -22,3 +22,20 @@ test('full account lifecycle, owner, content, sessions and access controls',asyn
  assert.equal((await login(env,'SuperAdmin',env.BOOTSTRAP_ADMIN_PASSWORD)).status,401);const dbString=JSON.stringify(sql.prepare('SELECT * FROM users').all());assert(!dbString.includes('Owner private'));assert(!dbString.includes(env.BOOTSTRAP_ADMIN_PASSWORD));sql.close();});
 test('login rate limit survives requests and rejects invalid origins',async()=>{const {env,sql}=setup();for(let i=0;i<10;i++)assert.equal((await login(env,'unknownuser','bad-password')).status,401);assert.equal((await login(env,'unknownuser','bad-password')).status,429);assert.equal((await call(env,'/api/auth/login',{username:'SuperAdmin',password:'x'},'','https://evil.test')).status,403);sql.close();});
 test('cookie parser, unknown endpoint and setup fail closed',async()=>{assert.equal(sessionToken(new Request(host,{headers:{cookie:'__Host-knieid_session=bad'}})),null);assert.equal((await call({},'/api/portal')).status,503);assert.equal((await call({},'/api/not-real')).status,404);});
+
+test('private archive importer protects data and media by role',async()=>{
+ const {env,sql}=setup();const roles=['member','committee','admin'];const sessions={};
+ assert.equal((await call(env,'/api/committee-archive')).status,401);
+ for(const role of roles){sql.prepare('INSERT INTO users(id,username,display_username,role,password_hash,password_salt,blocked,must_change,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(role,role,role,role,'hash','salt',0,0,new Date().toISOString());const value=role.charCodeAt(0).toString(16).repeat(32);const hash=Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value))).toString('hex');sql.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)').run(hash,role,Date.now()+60000);sessions[role]=value;}
+ const bundle={archive:{capturedAt:'2026-10-18',sections:[{title_en:'Test',title_de:'Test',body_en:'Private fixture',body_de:'Privater Test'}],photos:[{id:'123',source:'https://www.facebook.com/photo/?fbid=123',available:true}],links:[],transcripts:[]},images:{'123':'aGVsbG8='}};
+ assert.equal((await call(env,'/api/committee-archive',bundle,sessions.member)).status,403);
+ assert.equal((await call(env,'/api/committee-archive',bundle,sessions.committee)).status,403);
+ assert.equal((await call(env,'/api/committee-archive',bundle,sessions.admin,'https://evil.test')).status,403);
+ assert.equal((await call(env,'/api/committee-archive',bundle,sessions.admin)).status,200);
+ for(const role of roles){for(const path of ['/api/committee-archive','/api/committee-archive/media/123']){const result=await call(env,path,undefined,sessions[role]);assert.equal(result.status,role==='member'?403:200);assert.match(result.headers.get('cache-control'),/no-store/);}}
+ for(const role of roles){const regular=await(await call(env,'/api/portal',undefined,sessions[role])).json();assert(!JSON.stringify(regular).includes('Private fixture'));}
+ assert.equal((await call(env,'/api/portal',{action:'saveInformation',id:'committee-facebook-archive'},sessions.admin)).status,400);
+ assert.equal((await call(env,'/api/portal',{action:'deleteInformation',id:'committee-facebook-archive'},sessions.admin)).status,400);
+ sql.prepare("UPDATE users SET blocked=1 WHERE id='committee'").run();assert.equal((await call(env,'/api/committee-archive',undefined,sessions.committee)).status,401);
+ sql.prepare("UPDATE users SET must_change=1 WHERE id='admin'").run();assert.equal((await call(env,'/api/committee-archive',undefined,sessions.admin)).status,403);sql.close();
+});

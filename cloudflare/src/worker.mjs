@@ -1,3 +1,4 @@
+const ARCHIVE_ID='committee-facebook-archive';
 import {normalise,validUsername,randomToken,digest,hashPassword,verifyPassword,strongPassword,canManage,canRead,validOrigin,cookie,sessionToken,SESSION_SECONDS,equal,peppered,hex} from './security.mjs';
 const roles=['member','committee','admin'],audiences=['public','member','committee','admin'];
 const json=(body,status=200,extra={})=>Response.json(body,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...extra}});
@@ -45,13 +46,41 @@ async function mutate(request,env,user,b){const now=new Date().toISOString();
   await audit(env,user,old?'account_updated':'account_created',id,statements);return json({ok:true});
  }
  if(b.action==='saveInformation'){
+  if(b.id===ARCHIVE_ID)return json({error:'Use the committee archive importer'},400);
   const fields=['title_de','title_en','body_de','body_en'].map(k=>typeof b[k]==='string'?b[k].trim():'');if(!fields.every(Boolean)||fields[0].length>200||fields[1].length>200||fields[2].length>15000||fields[3].length>15000||!audiences.includes(b.audience))return json({error:'Complete both languages and select a valid audience'},400);
   const id=typeof b.id==='string'&&b.id?b.id:crypto.randomUUID();await audit(env,user,'information_saved',id,[env.DB.prepare('INSERT INTO information(id,title_de,title_en,body_de,body_en,audience,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title_de=excluded.title_de,title_en=excluded.title_en,body_de=excluded.body_de,body_en=excluded.body_en,audience=excluded.audience,updated_at=excluded.updated_at').bind(id,...fields,b.audience,now)]);return json({ok:true});
  }
- if(b.action==='deleteInformation'&&typeof b.id==='string'){await audit(env,user,'information_deleted',b.id,[env.DB.prepare('DELETE FROM information WHERE id=?').bind(b.id)]);return json({ok:true});}
+ if(b.action==='deleteInformation'&&typeof b.id==='string'){if(b.id===ARCHIVE_ID)return json({error:'Use the committee archive importer'},400);await audit(env,user,'information_deleted',b.id,[env.DB.prepare('DELETE FROM information WHERE id=?').bind(b.id)]);return json({ok:true});}
  return json({error:'Unknown action'},400);
 }
-async function api(request,env){const url=new URL(request.url);if(!['/api/portal','/api/auth/login','/api/auth/logout'].includes(url.pathname))return json({error:'Not found'},404);if(!env.DB||!env.AUTH_PEPPER||env.AUTH_PEPPER.length<32)return json({error:'Portal setup is incomplete. Contact the administrator.'},503);
+async function api(request,env){const url=new URL(request.url);if(!['/api/portal','/api/auth/login','/api/auth/logout','/api/committee-archive'].includes(url.pathname)&&!url.pathname.startsWith('/api/committee-archive/media/'))return json({error:'Not found'},404);if(!env.DB||!env.AUTH_PEPPER||env.AUTH_PEPPER.length<32)return json({error:'Portal setup is incomplete. Contact the administrator.'},503);
+
+ if(url.pathname==='/api/committee-archive'||url.pathname.startsWith('/api/committee-archive/media/')){
+  const viewer=await currentUser(request,env);
+  if(!viewer)return json({error:'Sign in required'},401);
+  if(!canRead(viewer,'committee'))return json({error:'Committee access required'},403);
+  if(request.method==='POST'&&url.pathname==='/api/committee-archive'){
+   if(!canManage(viewer))return json({error:'Administrator access required'},403);
+   if(!validOrigin(request))return json({error:'Invalid request origin'},403);
+   if(!request.headers.get('content-type')?.includes('application/json'))return json({error:'JSON required'},415);
+   const bytes=await request.text();if(bytes.length>2000000)return json({error:'Archive too large'},413);
+   let bundle;try{bundle=JSON.parse(bytes)}catch{return json({error:'Invalid archive JSON'},400)}
+   const a=bundle.archive,images=bundle.images;
+   if(!a||!Array.isArray(a.sections)||a.sections.length>50||!Array.isArray(a.photos)||a.photos.length>100||!Array.isArray(a.links)||a.links.length>100||!Array.isArray(a.transcripts)||a.transcripts.length>50||!images||typeof images!=='object'||Array.isArray(images))return json({error:'Invalid archive structure'},400);
+   const safeUrl=v=>typeof v==='string'&&v.length<2048&&v.startsWith('https://')&&!/[<>"\s]/.test(v);
+   if(!a.sections.every(x=>['title_en','title_de','body_en','body_de'].every(k=>typeof x[k]==='string'&&x[k].length<=50000))||!a.links.every(x=>typeof x.label==='string'&&safeUrl(x.url))||!a.photos.every(x=>/^\d{1,30}$/.test(x.id)&&safeUrl(x.source))||!a.transcripts.every(x=>typeof x==='string'&&x.length<=150000)||!Object.entries(images).every(([id,v])=>/^\d{1,30}$/.test(id)&&typeof v==='string'&&v.length<500000&&/^[A-Za-z0-9+/]+={0,2}$/.test(v)))return json({error:'Invalid archive fields'},400);
+   await audit(env,viewer,'committee_archive_imported',ARCHIVE_ID,[env.DB.prepare("INSERT INTO information(id,title_de,title_en,body_de,body_en,audience,updated_at) VALUES(?,?,?,?,?,'committee',?) ON CONFLICT(id) DO UPDATE SET body_en=excluded.body_en,audience='committee',updated_at=excluded.updated_at").bind(ARCHIVE_ID,'Facebook-Archiv','Facebook archive','',JSON.stringify(bundle),new Date().toISOString())]);return json({ok:true});
+  }
+  if(request.method!=='GET')return json({error:'Method not allowed'},405);
+  const stored=await env.DB.prepare('SELECT body_en FROM information WHERE id=?').bind(ARCHIVE_ID).first();
+  if(!stored)return url.pathname==='/api/committee-archive'?json({available:false}):json({error:'Not found'},404);
+  const bundle=JSON.parse(stored.body_en);
+  if(url.pathname==='/api/committee-archive')return json({...bundle.archive,available:true});
+  const id=url.pathname.slice('/api/committee-archive/media/'.length);
+  const encoded=Object.hasOwn(bundle.images,id)?bundle.images[id]:null;
+  if(!encoded)return json({error:'Not found'},404);
+  return new Response(Uint8Array.from(atob(encoded),c=>c.charCodeAt(0)),{headers:{'Content-Type':encoded.startsWith('iVBOR')?'image/png':'image/jpeg','Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Cross-Origin-Resource-Policy':'same-origin'}});
+ }
  if(request.method==='POST'){
   if(!validOrigin(request))return json({error:'Invalid request origin'},403);const b=await body(request);
   if(url.pathname==='/api/auth/login')return login(request,env,b);
@@ -60,7 +89,7 @@ async function api(request,env){const url=new URL(request.url);if(!['/api/portal
   if(!user)return json({error:'Sign in required'},401);return mutate(request,env,user,b);
  }
  if(request.method!=='GET')return json({error:'Method not allowed'},405);
- const user=await currentUser(request,env);let information=await env.DB.prepare('SELECT * FROM information ORDER BY updated_at DESC').all();information=information.results.filter(i=>canRead(user,i.audience));
+ const user=await currentUser(request,env);let information=await env.DB.prepare("SELECT * FROM information WHERE id <> 'committee-facebook-archive' ORDER BY updated_at DESC").all();information=information.results.filter(i=>canRead(user,i.audience));
  if(url.searchParams.get('action')==='admin'){
   if(!user)return json({error:'Sign in required'},401);if(!canManage(user))return json({error:'Administrator access required'},403);
   const users=await env.DB.prepare('SELECT id,display_username AS username,name,email,role,blocked,must_change,owner,created_at FROM users ORDER BY owner DESC,created_at DESC').all();const logs=await env.DB.prepare('SELECT id,actor,action,target,at FROM audit_log ORDER BY at DESC LIMIT 100').all();return json({user:clean(user),users:users.results,information,audit:logs.results});
